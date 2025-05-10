@@ -9,7 +9,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using AsyncKeyedLock;
-using Jellyfin.Data.Entities;
+using Jellyfin.Database.Implementations.Entities;
 using MediaBrowser.Common.Extensions;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Configuration;
@@ -524,11 +524,11 @@ public sealed class ImageProcessor : IImageProcessor, IDisposable
     /// <inheritdoc />
     public void CreateImageCollage(ImageCollageOptions options, string? libraryName)
     {
-        _logger.LogInformation("Creating image collage and saving to {Path}", options.OutputPath);
+        _logger.LogDebug("Creating image collage and saving to {Path}", options.OutputPath);
 
         _imageEncoder.CreateImageCollage(options, libraryName);
 
-        _logger.LogInformation("Completed creation of image collage and saved to {Path}", options.OutputPath);
+        _logger.LogDebug("Completed creation of image collage and saved to {Path}", options.OutputPath);
     }
 
     /// <inheritdoc />

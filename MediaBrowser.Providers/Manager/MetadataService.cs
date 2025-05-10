@@ -12,6 +12,7 @@ using Jellyfin.Extensions;
 using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.Audio;
+using MediaBrowser.Controller.IO;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Providers;
 using MediaBrowser.Model.Configuration;
@@ -26,13 +27,20 @@ namespace MediaBrowser.Providers.Manager
         where TItemType : BaseItem, IHasLookupInfo<TIdType>, new()
         where TIdType : ItemLookupInfo, new()
     {
-        protected MetadataService(IServerConfigurationManager serverConfigurationManager, ILogger<MetadataService<TItemType, TIdType>> logger, IProviderManager providerManager, IFileSystem fileSystem, ILibraryManager libraryManager)
+        protected MetadataService(
+            IServerConfigurationManager serverConfigurationManager,
+            ILogger<MetadataService<TItemType, TIdType>> logger,
+            IProviderManager providerManager,
+            IFileSystem fileSystem,
+            ILibraryManager libraryManager,
+            IExternalDataManager externalDataManager)
         {
             ServerConfigurationManager = serverConfigurationManager;
             Logger = logger;
             ProviderManager = providerManager;
             FileSystem = fileSystem;
             LibraryManager = libraryManager;
+            ExternalDataManager = externalDataManager;
             ImageProvider = new ItemImageProvider(Logger, ProviderManager, FileSystem);
         }
 
@@ -47,6 +55,8 @@ namespace MediaBrowser.Providers.Manager
         protected IFileSystem FileSystem { get; }
 
         protected ILibraryManager LibraryManager { get; }
+
+        protected IExternalDataManager ExternalDataManager { get; }
 
         protected virtual bool EnableUpdatingPremiereDateFromChildren => false;
 
@@ -128,8 +138,7 @@ namespace MediaBrowser.Providers.Manager
 
             var metadataResult = new MetadataResult<TItemType>
             {
-                Item = itemOfType,
-                People = LibraryManager.GetPeople(item)
+                Item = itemOfType
             };
 
             var beforeSaveResult = BeforeSave(itemOfType, isFirstRefresh || refreshOptions.ReplaceAllMetadata || refreshOptions.MetadataRefreshMode == MetadataRefreshMode.FullRefresh || requiresRefresh || refreshOptions.ForceSave, updateType);
@@ -193,6 +202,7 @@ namespace MediaBrowser.Providers.Manager
             if (hasRefreshedMetadata && hasRefreshedImages)
             {
                 item.DateLastRefreshed = DateTime.UtcNow;
+                updateType |= item.OnMetadataChanged();
             }
 
             updateType = await SaveInternal(item, refreshOptions, updateType, isFirstRefresh, requiresRefresh, metadataResult, cancellationToken).ConfigureAwait(false);
@@ -252,7 +262,7 @@ namespace MediaBrowser.Providers.Manager
 
         protected async Task SaveItemAsync(MetadataResult<TItemType> result, ItemUpdateType reason, CancellationToken cancellationToken)
         {
-            if (result.Item.SupportsPeople)
+            if (result.Item.SupportsPeople && result.People is not null)
             {
                 var baseItem = result.Item;
 
@@ -301,6 +311,38 @@ namespace MediaBrowser.Providers.Manager
             {
                 item.PresentationUniqueKey = presentationUniqueKey;
                 updateType |= ItemUpdateType.MetadataImport;
+            }
+
+            // Cleanup extracted files if source file was modified
+            var itemPath = item.Path;
+            if (!string.IsNullOrEmpty(itemPath))
+            {
+                var info = FileSystem.GetFileSystemInfo(itemPath);
+                var modificationDate = info.LastWriteTimeUtc;
+                var itemLastModifiedFileSystem = item.DateModified;
+                if (info.Exists && itemLastModifiedFileSystem != modificationDate)
+                {
+                    Logger.LogDebug("File modification time changed from {Then} to {Now}: {Path}", itemLastModifiedFileSystem, modificationDate, itemPath);
+
+                    item.DateModified = modificationDate;
+                    if (ServerConfigurationManager.GetMetadataConfiguration().UseFileCreationTimeForDateAdded)
+                    {
+                        item.DateCreated = info.CreationTimeUtc;
+                    }
+
+                    var size = info.Length;
+                    if (item is Video video)
+                    {
+                        var videoType = video.VideoType;
+                        if (videoType == VideoType.BluRay || video.VideoType == VideoType.Dvd)
+                        {
+                            Logger.LogInformation("File changed, pruning extracted data: {Path}", item.Path);
+                            ExternalDataManager.DeleteExternalItemDataAsync(video, CancellationToken.None).GetAwaiter().GetResult();
+                        }
+                    }
+
+                    updateType |= ItemUpdateType.MetadataImport;
+                }
             }
 
             return updateType;
@@ -1041,7 +1083,7 @@ namespace MediaBrowser.Providers.Manager
                 }
                 else
                 {
-                    target.Studios = target.Studios.Concat(source.Studios).Distinct().ToArray();
+                    target.Studios = target.Studios.Concat(source.Studios).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
                 }
             }
 
@@ -1053,7 +1095,7 @@ namespace MediaBrowser.Providers.Manager
                 }
                 else
                 {
-                    target.Tags = target.Tags.Concat(source.Tags).Distinct().ToArray();
+                    target.Tags = target.Tags.Concat(source.Tags).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
                 }
             }
 
@@ -1065,7 +1107,7 @@ namespace MediaBrowser.Providers.Manager
                 }
                 else
                 {
-                    target.ProductionLocations = target.ProductionLocations.Concat(source.ProductionLocations).Distinct().ToArray();
+                    target.ProductionLocations = target.ProductionLocations.Concat(source.ProductionLocations).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
                 }
             }
 
@@ -1132,6 +1174,11 @@ namespace MediaBrowser.Providers.Manager
                     target.DateCreated = source.DateCreated;
                 }
 
+                if (replaceData || source.DateModified != default)
+                {
+                    target.DateModified = source.DateModified;
+                }
+
                 if (replaceData || string.IsNullOrEmpty(target.PreferredMetadataCountryCode))
                 {
                     target.PreferredMetadataCountryCode = source.PreferredMetadataCountryCode;
@@ -1146,13 +1193,24 @@ namespace MediaBrowser.Providers.Manager
 
         private static void MergePeople(IReadOnlyList<PersonInfo> source, IReadOnlyList<PersonInfo> target)
         {
-            foreach (var person in target)
-            {
-                var normalizedName = person.Name.RemoveDiacritics();
-                var personInSource = source.FirstOrDefault(i => string.Equals(i.Name.RemoveDiacritics(), normalizedName, StringComparison.OrdinalIgnoreCase));
+            var sourceByName = source.ToLookup(p => p.Name.RemoveDiacritics(), StringComparer.OrdinalIgnoreCase);
+            var targetByName = target.ToLookup(p => p.Name.RemoveDiacritics(), StringComparer.OrdinalIgnoreCase);
 
-                if (personInSource is not null)
+            foreach (var name in targetByName.Select(g => g.Key))
+            {
+                var targetPeople = targetByName[name].ToArray();
+                var sourcePeople = sourceByName[name].ToArray();
+
+                if (sourcePeople.Length == 0)
                 {
+                    continue;
+                }
+
+                for (int i = 0; i < targetPeople.Length; i++)
+                {
+                    var person = targetPeople[i];
+                    var personInSource = i < sourcePeople.Length ? sourcePeople[i] : sourcePeople[0];
+
                     foreach (var providerId in personInSource.ProviderIds)
                     {
                         person.ProviderIds.TryAdd(providerId.Key, providerId.Value);
@@ -1161,6 +1219,16 @@ namespace MediaBrowser.Providers.Manager
                     if (string.IsNullOrWhiteSpace(person.ImageUrl))
                     {
                         person.ImageUrl = personInSource.ImageUrl;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(personInSource.Role) && string.IsNullOrWhiteSpace(person.Role))
+                    {
+                        person.Role = personInSource.Role;
+                    }
+
+                    if (personInSource.SortOrder.HasValue && !person.SortOrder.HasValue)
+                    {
+                        person.SortOrder = personInSource.SortOrder;
                     }
                 }
             }
@@ -1193,7 +1261,7 @@ namespace MediaBrowser.Providers.Manager
                 }
                 else if (sourceHasAlbumArtist.AlbumArtists.Count > 0)
                 {
-                    targetHasAlbumArtist.AlbumArtists = targetHasAlbumArtist.AlbumArtists.Concat(sourceHasAlbumArtist.AlbumArtists).Distinct().ToArray();
+                    targetHasAlbumArtist.AlbumArtists = targetHasAlbumArtist.AlbumArtists.Concat(sourceHasAlbumArtist.AlbumArtists).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
                 }
             }
         }
